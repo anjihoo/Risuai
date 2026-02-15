@@ -376,173 +376,197 @@ export class RisuSaveDecoder {
         content: string;
     }[] = []
     async decode(data: Uint8Array): Promise<Database> {
-        console.log('Decoding RisuSave data');
-        let offset = magicRisuSaveHeader.length;
-        //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
-        let db:Database = {}
-        const loadedBlocks = new Set<string>();
-        while (offset < data.length) {
-            try {
-                const type = data[offset];
-                const compression = data[offset + 1] === 1;
-                offset += 2;
+      console.log("Decoding RisuSave data");
+      let offset = magicRisuSaveHeader.length;
+      //@ts-expect-error Database has required fields, but we initialize empty and populate incrementally during decode
+      let db: Database = {};
+      const loadedBlocks = new Set<string>();
+      // 1차: 블록 파싱 (압축 해제 포함)
+      while (offset < data.length) {
+        try {
+          const type = data[offset];
+          const compression = data[offset + 1] === 1;
+          offset += 2;
 
-                const nameLength = data[offset];
-                offset += 1;
-                const name = new TextDecoder().decode(data.subarray(offset, offset + nameLength));
-                offset += nameLength;
+          const nameLength = data[offset];
+          offset += 1;
+          const name = new TextDecoder().decode(
+            data.subarray(offset, offset + nameLength),
+          );
+          offset += nameLength;
 
-                const newArrayBuf = new ArrayBuffer(4);
-                const lengthSubUint8Buf = data.slice(offset, offset + 4);
-                new Uint8Array(newArrayBuf).set(lengthSubUint8Buf);
-                const length = new Uint32Array(newArrayBuf)[0];
-                offset += 4;
+          const newArrayBuf = new ArrayBuffer(4);
+          const lengthSubUint8Buf = data.slice(offset, offset + 4);
+          new Uint8Array(newArrayBuf).set(lengthSubUint8Buf);
+          const length = new Uint32Array(newArrayBuf)[0];
+          offset += 4;
 
-                let blockData = data.subarray(offset, offset + length);
-                offset += length;
+          let blockData = data.subarray(offset, offset + length);
+          offset += length;
 
-                if (compression) {
-                    //decode using DecompressionStream
-                    await checkCompressionStreams();
-                    const cs = new DecompressionStream('gzip');
-                    const writer = cs.writable.getWriter();
-                    writer.write(blockData as any);
-                    writer.close();
-                    const buf = await new Response(cs.readable).arrayBuffer();
-                    blockData = new Uint8Array(buf);
-                }
+          if (compression) {
+            //decode using DecompressionStream
+            await checkCompressionStreams();
+            const cs = new DecompressionStream("gzip");
+            const writer = cs.writable.getWriter();
+            writer.write(blockData as any);
+            writer.close();
+            const buf = await new Response(cs.readable).arrayBuffer();
+            blockData = new Uint8Array(buf);
+          }
 
-                loadedBlocks.add(name);
-                this.blocks.push({
-                    name,
-                    type,
-                    compression,
-                    content: new TextDecoder().decode(blockData)
-                })   
-            } catch (error) {
-                continue
-            }
+          loadedBlocks.add(name);
+          this.blocks.push({
+            name,
+            type,
+            compression,
+            content: new TextDecoder().decode(blockData),
+          });
+        } catch (error) {
+          continue;
         }
-        console.log('blocks',this.blocks)
-        let directory: string[] = []
-        for(let i = 0; i < this.blocks.length; i++){
-            const key = i;
-            switch(this.blocks[key].type){
-                case RisuSaveType.ROOT:{
-                    const rootData = JSON.parse(this.blocks[key].content);
-                    for(const rootKey in rootData){
-                        if(!db[rootKey] && !rootKey.startsWith('__')){
-                            db[rootKey] = rootData[rootKey];
-                        }
-                        if(rootKey === '__directory'){
-                            directory = rootData[rootKey];
-                            console.log('RisuSave directory:', directory);
-                            for(const dirKey of directory){
-                                if(!loadedBlocks.has(dirKey)){
-                                    try {
-                                        console.log(`Loading directory block ${dirKey} from cache`);
-                                        const dirData:{
-                                            type:RisuSaveType
-                                            data:string
-                                            name:string
-                                        } = await risuSaveCacheForage.getItem(`risuSaveBlock_${dirKey}`) as any;
-
-                                        if(dirData){
-                                            this.blocks.push({
-                                                name: dirData.name,
-                                                type: dirData.type,
-                                                compression: false,
-                                                content: dirData.data
-                                            });
-                                            loadedBlocks.add(dirKey);
-                                        }
-                                    } catch (error) {
-                                        console.error(`Error loading directory block ${dirKey}:`, error);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-                case RisuSaveType.CHARACTER_WITH_CHAT:
-                case RisuSaveType.CHARACTER_WITHOUT_CHAT:{
-                    db.characters ??= [];
-                    const character = JSON.parse(this.blocks[key].content);
-                    db.characters.push(character);
-                    break
-                }
-                case RisuSaveType.BOTPRESET:{
-                    db.botPresets = JSON.parse(this.blocks[key].content);
-                    break;
-                }
-                case RisuSaveType.MODULES:{
-                    db.modules = JSON.parse(this.blocks[key].content);
-                    break;
-                }
-                case RisuSaveType.CONFIG:{
-                    //ignore for now
-                    break;
-                }
-                case RisuSaveType.REMOTE:{
-                    const remoteInfo:{
-                        v:number
-                        type:RisuSaveType
-                        name:string
-                    } = JSON.parse(this.blocks[key].content);
-                    const fileName = `remotes/${remoteInfo.name}.local.bin`
-                    let remoteData:Uint8Array|null = null
-                    if(isTauri){
-                        try {
-                            if(await exists(fileName, { baseDir: BaseDirectory.AppData })){
-                                remoteData = await readFile(fileName, { baseDir: BaseDirectory.AppData });
-                            }
-                        } catch (error) {
-                            console.error(`Error reading remote file ${fileName} in Tauri:`, error);
-                        }
-                    }
-                    else{
-                        const stored = await forageStorage.getItem(fileName);
-                        if(stored){
-                            remoteData = stored as Uint8Array;
-                        }
-                    }
-
-                    if(!remoteData){
-                        console.warn(`Remote file ${fileName} not found.`);
-                        break;
-                    }
-                    const decoded = new TextDecoder().decode(remoteData)
-
-                    //add to blocks for further processing
-                    this.blocks.push({
-                        name: remoteInfo.name,
-                        type: remoteInfo.type,
-                        compression: false,
-                        content: decoded
+      }
+      console.log("blocks", this.blocks);
+      let directory: string[] = [];
+      // 2차: remotes/ 블록 병렬 처리
+      const remoteBlockPromises: Promise<void>[] = [];
+      for (let i = 0; i < this.blocks.length; i++) {
+        const key = i;
+        if (this.blocks[key].type === RisuSaveType.REMOTE) {
+          const remoteInfo = JSON.parse(this.blocks[key].content);
+          const fileName = `remotes/${remoteInfo.name}.local.bin`;
+          remoteBlockPromises.push(
+            (async () => {
+              let remoteData: Uint8Array | null = null;
+              if (isTauri) {
+                try {
+                  if (
+                    await exists(fileName, { baseDir: BaseDirectory.AppData })
+                  ) {
+                    remoteData = await readFile(fileName, {
+                      baseDir: BaseDirectory.AppData,
                     });
-                    break;
+                  }
+                } catch (error) {
+                  console.error(
+                    `Error reading remote file ${fileName} in Tauri:`,
+                    error,
+                  );
                 }
-                case RisuSaveType.ROOT_COMPONENT:{
-                    const componentData:{
-                        data:any
-                        key:string
-                    } = JSON.parse(this.blocks[key].content);
-                    db[componentData.key] = componentData.data;
-                    break;
+              } else {
+                const stored = await forageStorage.getItem(fileName);
+                if (stored) {
+                  remoteData = stored as Uint8Array;
                 }
-                default:{
-                    console.warn(`Not Implemented RisuSaveType: ${this.blocks[key].type} for ${this.blocks[key].name}`);
+              }
+              if (remoteData) {
+                const decoded = new TextDecoder().decode(remoteData);
+                this.blocks.push({
+                  name: remoteInfo.name,
+                  type: remoteInfo.type,
+                  compression: false,
+                  content: decoded,
+                });
+              } else {
+                console.warn(`Remote file ${fileName} not found.`);
+              }
+            })(),
+          );
+        }
+      }
+      await Promise.all(remoteBlockPromises);
+      // 3차: 나머지 블록 처리
+      for (let i = 0; i < this.blocks.length; i++) {
+        const key = i;
+        switch (this.blocks[key].type) {
+          case RisuSaveType.ROOT: {
+            const rootData = JSON.parse(this.blocks[key].content);
+            for (const rootKey in rootData) {
+              if (!db[rootKey] && !rootKey.startsWith("__")) {
+                db[rootKey] = rootData[rootKey];
+              }
+              if (rootKey === "__directory") {
+                directory = rootData[rootKey];
+                console.log("RisuSave directory:", directory);
+                for (const dirKey of directory) {
+                  if (!loadedBlocks.has(dirKey)) {
+                    try {
+                      console.log(
+                        `Loading directory block ${dirKey} from cache`,
+                      );
+                      const dirData: {
+                        type: RisuSaveType;
+                        data: string;
+                        name: string;
+                      } = (await risuSaveCacheForage.getItem(
+                        `risuSaveBlock_${dirKey}`,
+                      )) as any;
+                      if (dirData) {
+                        this.blocks.push({
+                          name: dirData.name,
+                          type: dirData.type,
+                          compression: false,
+                          content: dirData.data,
+                        });
+                        loadedBlocks.add(dirKey);
+                      }
+                    } catch (error) {
+                      console.error(
+                        `Error loading directory block ${dirKey}:`,
+                        error,
+                      );
+                    }
+                  }
                 }
+              }
             }
+            break;
+          }
+          case RisuSaveType.CHARACTER_WITH_CHAT:
+          case RisuSaveType.CHARACTER_WITHOUT_CHAT: {
+            db.characters ??= [];
+            const character = JSON.parse(this.blocks[key].content);
+            db.characters.push(character);
+            break;
+          }
+          case RisuSaveType.BOTPRESET: {
+            db.botPresets = JSON.parse(this.blocks[key].content);
+            break;
+          }
+          case RisuSaveType.MODULES: {
+            db.modules = JSON.parse(this.blocks[key].content);
+            break;
+          }
+          case RisuSaveType.CONFIG: {
+            //ignore for now
+            break;
+          }
+          case RisuSaveType.REMOTE: {
+            // 이미 병렬로 처리함
+            break;
+          }
+          case RisuSaveType.ROOT_COMPONENT: {
+            const componentData: {
+              data: any;
+              key: string;
+            } = JSON.parse(this.blocks[key].content);
+            db[componentData.key] = componentData.data;
+            break;
+          }
+          default: {
+            console.warn(
+              `Not Implemented RisuSaveType: ${this.blocks[key].type} for ${this.blocks[key].name}`,
+            );
+          }
         }
-        //to fix botpreset bugs
-        if(!Array.isArray(db.botPresets) || db.botPresets.length === 0){
-            db.botPresets = [presetTemplate]
-            db.botPresetsId = 0
-        }
-        console.log('Decoded RisuSave data', db);
-        return db;
+      }
+      //to fix botpreset bugs
+      if (!Array.isArray(db.botPresets) || db.botPresets.length === 0) {
+        db.botPresets = [presetTemplate];
+        db.botPresetsId = 0;
+      }
+      console.log("Decoded RisuSave data", db);
+      return db;
     }
 }
 
