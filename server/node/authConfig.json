@@ -1,0 +1,5 @@
+{
+  "username": "yourid",
+  "password": "yourpassword",
+  "otpSecret": "JBSWY3DPEHPK3PXP" // 예시: 구글 OTP 시크릿
+}

@@ -5,497 +5,552 @@ const htmlparser = require('node-html-parser');
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = require('fs');
 const fs = require('fs/promises')
 const crypto = require('crypto')
-app.use(express.static(path.join(process.cwd(), 'dist'), {index: false}));
-app.use(express.json({ limit: '100mb' }));
-app.use(express.raw({ type: 'application/octet-stream', limit: '100mb' }));
-app.use(express.text({ limit: '100mb' }));
-const {pipeline} = require('stream/promises')
-const https = require('https');
-const sslPath = path.join(process.cwd(), 'server/node/ssl/certificate');
-const hubURL = 'https://sv.risuai.xyz'; 
-const openid = require('openid-client');
+const jwt = require("jsonwebtoken");
+const otplib = require("otplib");
+const authConfigPath = path.join(
+  process.cwd(),
+  "server",
+  "node",
+  "authConfig.json",
+);
+let authConfig = { username: "", password: "", otpSecret: "" };
+if (existsSync(authConfigPath)) {
+  authConfig = JSON.parse(readFileSync(authConfigPath, "utf-8"));
+}
+const JWT_SECRET = crypto.randomBytes(32).toString("hex");
 
-let password = ''
+app.use(express.static(path.join(process.cwd(), "dist"), { index: false }));
+app.use(express.json({ limit: "100mb" }));
+app.use(express.raw({ type: "application/octet-stream", limit: "100mb" }));
+app.use(express.text({ limit: "100mb" }));
+const { pipeline } = require("stream/promises");
+const https = require("https");
+const sslPath = path.join(process.cwd(), "server/node/ssl/certificate");
+const hubURL = "https://sv.risuai.xyz";
+const openid = require("openid-client");
 
-const savePath = path.join(process.cwd(), "save")
-if(!existsSync(savePath)){
-    mkdirSync(savePath)
+let password = "";
+
+const savePath = path.join(process.cwd(), "save");
+if (!existsSync(savePath)) {
+  mkdirSync(savePath);
 }
 
-const passwordPath = path.join(process.cwd(), 'save', '__password')
-if(existsSync(passwordPath)){
-    password = readFileSync(passwordPath, 'utf-8')
+const passwordPath = path.join(process.cwd(), "save", "__password");
+if (existsSync(passwordPath)) {
+  password = readFileSync(passwordPath, "utf-8");
 }
 
-const authCodePath = path.join(process.cwd(), 'save', '__authcode')
+const authCodePath = path.join(process.cwd(), "save", "__authcode");
 const hexRegex = /^[0-9a-fA-F]+$/;
 function isHex(str) {
-    return hexRegex.test(str.toUpperCase().trim()) || str === '__password';
+  return hexRegex.test(str.toUpperCase().trim()) || str === "__password";
 }
 
-app.get('/', async (req, res, next) => {
+app.get("/", async (req, res, next) => {
+  const clientIP =
+    req.headers["x-forwarded-for"] ||
+    req.ip ||
+    req.socket.remoteAddress ||
+    "Unknown IP";
+  const timestamp = new Date().toISOString();
+  console.log(`[Server] ${timestamp} | Connection from: ${clientIP}`);
 
-    const clientIP = req.headers['x-forwarded-for'] || req.ip || req.socket.remoteAddress || 'Unknown IP';
-    const timestamp = new Date().toISOString();
-    console.log(`[Server] ${timestamp} | Connection from: ${clientIP}`);
-    
-    try {
-        const mainIndex = await fs.readFile(path.join(process.cwd(), 'dist', 'index.html'))
-        const root = htmlparser.parse(mainIndex)
-        const head = root.querySelector('head')
-        head.innerHTML = `<script>globalThis.__NODE__ = true</script>` + head.innerHTML
-        
-        res.send(root.toString())
-    } catch (error) {
-        console.log(error)
-        next(error)
-    }
-})
+  try {
+    const mainIndex = await fs.readFile(
+      path.join(process.cwd(), "dist", "index.html"),
+    );
+    const root = htmlparser.parse(mainIndex);
+    const head = root.querySelector("head");
+    head.innerHTML =
+      `<script>globalThis.__NODE__ = true</script>` + head.innerHTML;
+
+    res.send(root.toString());
+  } catch (error) {
+    console.log(error);
+    next(error);
+  }
+});
 
 const reverseProxyFunc = async (req, res, next) => {
-    const authHeader = req.headers['risu-auth'];
-    if(!authHeader || authHeader.trim() !== password.trim()){
-        console.log('incorrect', 'received:', authHeader, 'expected:', password)
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    
-    const urlParam = req.headers['risu-url'] ? decodeURIComponent(req.headers['risu-url']) : req.query.url;
+  const authHeader = req.headers["risu-auth"];
+  if (!authHeader || authHeader.trim() !== password.trim()) {
+    console.log("incorrect", "received:", authHeader, "expected:", password);
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
 
-    if (!urlParam) {
-        res.status(400).send({
-            error:'URL has no param'
-        });
-        return;
-    }
-    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
-    if(!header['x-forwarded-for']){
-        header['x-forwarded-for'] = req.ip
-    }
+  const urlParam = req.headers["risu-url"]
+    ? decodeURIComponent(req.headers["risu-url"])
+    : req.query.url;
 
-    if(req.headers['authorization']?.startsWith('X-SERVER-REGISTER')){
-        if(!existsSync(authCodePath)){
-            delete header['authorization']
-        }
-        else{
-            const authCode = fs.readFileSync(authCodePath, 'utf-8')
-            header['authorization'] = `Bearer ${authCode}`
-        }
-    }
-    let originalResponse;
-    try {
-        // make request to original server
-        originalResponse = await fetch(urlParam, {
-            method: req.method,
-            headers: header,
-            body: JSON.stringify(req.body)
-        });
-        // get response body as stream
-        const originalBody = originalResponse.body;
-        // get response headers
-        const head = new Headers(originalResponse.headers);
-        head.delete('content-security-policy');
-        head.delete('content-security-policy-report-only');
-        head.delete('clear-site-data');
-        head.delete('Cache-Control');
-        head.delete('Content-Encoding');
-        const headObj = {};
-        for (let [k, v] of head) {
-            headObj[k] = v;
-        }
-        // send response headers to client
-        res.header(headObj);
-        // send response status to client
-        res.status(originalResponse.status);
-        // send response body to client
-        await pipeline(originalResponse.body, res);
+  if (!urlParam) {
+    res.status(400).send({
+      error: "URL has no param",
+    });
+    return;
+  }
+  const header = req.headers["risu-header"]
+    ? JSON.parse(decodeURIComponent(req.headers["risu-header"]))
+    : req.headers;
+  if (!header["x-forwarded-for"]) {
+    header["x-forwarded-for"] = req.ip;
+  }
 
-
+  if (req.headers["authorization"]?.startsWith("X-SERVER-REGISTER")) {
+    if (!existsSync(authCodePath)) {
+      delete header["authorization"];
+    } else {
+      const authCode = fs.readFileSync(authCodePath, "utf-8");
+      header["authorization"] = `Bearer ${authCode}`;
     }
-    catch (err) {
-        next(err);
-        return;
+  }
+  let originalResponse;
+  try {
+    // make request to original server
+    originalResponse = await fetch(urlParam, {
+      method: req.method,
+      headers: header,
+      body: JSON.stringify(req.body),
+    });
+    // get response body as stream
+    const originalBody = originalResponse.body;
+    // get response headers
+    const head = new Headers(originalResponse.headers);
+    head.delete("content-security-policy");
+    head.delete("content-security-policy-report-only");
+    head.delete("clear-site-data");
+    head.delete("Cache-Control");
+    head.delete("Content-Encoding");
+    const headObj = {};
+    for (let [k, v] of head) {
+      headObj[k] = v;
     }
-}
+    // send response headers to client
+    res.header(headObj);
+    // send response status to client
+    res.status(originalResponse.status);
+    // send response body to client
+    await pipeline(originalResponse.body, res);
+  } catch (err) {
+    next(err);
+    return;
+  }
+};
 
 const reverseProxyFunc_get = async (req, res, next) => {
-    const authHeader = req.headers['risu-auth'];
-    if(!authHeader || authHeader.trim() !== password.trim()){
-        console.log('incorrect', 'received:', authHeader, 'expected:', password)
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    
-    const urlParam = req.headers['risu-url'] ? decodeURIComponent(req.headers['risu-url']) : req.query.url;
+  const authHeader = req.headers["risu-auth"];
+  if (!authHeader || authHeader.trim() !== password.trim()) {
+    console.log("incorrect", "received:", authHeader, "expected:", password);
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
 
-    if (!urlParam) {
-        res.status(400).send({
-            error:'URL has no param'
-        });
-        return;
+  const urlParam = req.headers["risu-url"]
+    ? decodeURIComponent(req.headers["risu-url"])
+    : req.query.url;
+
+  if (!urlParam) {
+    res.status(400).send({
+      error: "URL has no param",
+    });
+    return;
+  }
+  const header = req.headers["risu-header"]
+    ? JSON.parse(decodeURIComponent(req.headers["risu-header"]))
+    : req.headers;
+  if (!header["x-forwarded-for"]) {
+    header["x-forwarded-for"] = req.ip;
+  }
+  let originalResponse;
+  try {
+    // make request to original server
+    originalResponse = await fetch(urlParam, {
+      method: "GET",
+      headers: header,
+    });
+    // get response body as stream
+    const originalBody = originalResponse.body;
+    // get response headers
+    const head = new Headers(originalResponse.headers);
+    head.delete("content-security-policy");
+    head.delete("content-security-policy-report-only");
+    head.delete("clear-site-data");
+    head.delete("Cache-Control");
+    head.delete("Content-Encoding");
+    const headObj = {};
+    for (let [k, v] of head) {
+      headObj[k] = v;
     }
-    const header = req.headers['risu-header'] ? JSON.parse(decodeURIComponent(req.headers['risu-header'])) : req.headers;
-    if(!header['x-forwarded-for']){
-        header['x-forwarded-for'] = req.ip
-    }
-    let originalResponse;
-    try {
-        // make request to original server
-        originalResponse = await fetch(urlParam, {
-            method: 'GET',
-            headers: header
-        });
-        // get response body as stream
-        const originalBody = originalResponse.body;
-        // get response headers
-        const head = new Headers(originalResponse.headers);
-        head.delete('content-security-policy');
-        head.delete('content-security-policy-report-only');
-        head.delete('clear-site-data');
-        head.delete('Cache-Control');
-        head.delete('Content-Encoding');
-        const headObj = {};
-        for (let [k, v] of head) {
-            headObj[k] = v;
-        }
-        // send response headers to client
-        res.header(headObj);
-        // send response status to client
-        res.status(originalResponse.status);
-        // send response body to client
-        await pipeline(originalResponse.body, res);
-    }
-    catch (err) {
-        next(err);
-        return;
-    }
-}
+    // send response headers to client
+    res.header(headObj);
+    // send response status to client
+    res.status(originalResponse.status);
+    // send response body to client
+    await pipeline(originalResponse.body, res);
+  } catch (err) {
+    next(err);
+    return;
+  }
+};
 
 let accessTokenCache = {
-    token: null,
-    expiry: 0
-}
+  token: null,
+  expiry: 0,
+};
 async function getSionywAccessToken() {
-    if(accessTokenCache.token && Date.now() < accessTokenCache.expiry){
-        return accessTokenCache.token;
-    }
-    //Schema of the client data file
-    // {
-    //     refresh_token: string;
-    //     client_id: string;
-    //     client_secret: string;
-    // }
-    
-    const clientDataPath = path.join(process.cwd(), 'save', '__sionyw_client_data.json');
-    let refreshToken = ''
-    let clientId = ''
-    let clientSecret = ''
-    if(!existsSync(clientDataPath)){
-        throw new Error('No Sionyw client data found');
-    }
-    const clientDataRaw = readFileSync(clientDataPath, 'utf-8');
-    const clientData = JSON.parse(clientDataRaw);
-    refreshToken = clientData.refresh_token;
-    clientId = clientData.client_id;
-    clientSecret = clientData.client_secret;
+  if (accessTokenCache.token && Date.now() < accessTokenCache.expiry) {
+    return accessTokenCache.token;
+  }
+  //Schema of the client data file
+  // {
+  //     refresh_token: string;
+  //     client_id: string;
+  //     client_secret: string;
+  // }
 
-    //Oauth Refresh Token Flow
-    
-    const tokenResponse = await fetch('account.sionyw.com/account/api/oauth/token', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: refreshToken,
-            client_id: clientId,
-            client_secret: clientSecret
-        })
-    })
+  const clientDataPath = path.join(
+    process.cwd(),
+    "save",
+    "__sionyw_client_data.json",
+  );
+  let refreshToken = "";
+  let clientId = "";
+  let clientSecret = "";
+  if (!existsSync(clientDataPath)) {
+    throw new Error("No Sionyw client data found");
+  }
+  const clientDataRaw = readFileSync(clientDataPath, "utf-8");
+  const clientData = JSON.parse(clientDataRaw);
+  refreshToken = clientData.refresh_token;
+  clientId = clientData.client_id;
+  clientSecret = clientData.client_secret;
 
-    if(!tokenResponse.ok){
-        throw new Error('Failed to refresh Sionyw access token');
-    }
+  //Oauth Refresh Token Flow
 
-    const tokenData = await tokenResponse.json();
+  const tokenResponse = await fetch(
+    "account.sionyw.com/account/api/oauth/token",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }),
+    },
+  );
 
-    //Update the refresh token in the client data file
-    if(tokenData.refresh_token && tokenData.refresh_token !== refreshToken){
-        clientData.refresh_token = tokenData.refresh_token;
-        writeFileSync(clientDataPath, JSON.stringify(clientData), 'utf-8');
-    }
+  if (!tokenResponse.ok) {
+    throw new Error("Failed to refresh Sionyw access token");
+  }
 
-    accessTokenCache.token = tokenData.access_token;
-    accessTokenCache.expiry = Date.now() + (tokenData.expires_in * 1000) - (5 * 60 * 1000); //5 minutes early
+  const tokenData = await tokenResponse.json();
 
-    return tokenData.access_token;
+  //Update the refresh token in the client data file
+  if (tokenData.refresh_token && tokenData.refresh_token !== refreshToken) {
+    clientData.refresh_token = tokenData.refresh_token;
+    writeFileSync(clientDataPath, JSON.stringify(clientData), "utf-8");
+  }
+
+  accessTokenCache.token = tokenData.access_token;
+  accessTokenCache.expiry =
+    Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000; //5 minutes early
+
+  return tokenData.access_token;
 }
-
 
 async function hubProxyFunc(req, res) {
-    const excludedHeaders = [
-        'content-encoding',
-        'content-length',
-        'transfer-encoding'
-    ];
+  const excludedHeaders = [
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+  ];
 
-    try {
-        let externalURL = '';
+  try {
+    let externalURL = "";
 
-        const pathHeader = req.headers['x-risu-node-path'];
-        if (pathHeader) {
-            const decodedPath = decodeURIComponent(pathHeader);
-            externalURL = decodedPath;
-        } else {
-            const pathAndQuery = req.originalUrl.replace(/^\/hub-proxy/, '');
-            externalURL = hubURL + pathAndQuery;
-        }
-        
-        const headersToSend = { ...req.headers };
-        delete headersToSend.host;
-        delete headersToSend.connection;
-        delete headersToSend['content-length'];
-        delete headersToSend['x-risu-node-path'];
-
-        const hubOrigin = new URL(hubURL).origin;
-        headersToSend.origin = hubOrigin;
-
-        //if Authorization header is "Server-Auth, set the token to be Server-Auth
-        if(headersToSend['Authorization'] === 'X-Node-Server-Auth'){
-            //this requires password auth
-            const authHeader = req.headers['risu-auth'];
-            if(!authHeader || authHeader.trim() !== password.trim()){
-                console.log('incorrect', 'received:', authHeader, 'expected:', password)
-                throw new Error('Incorrect password for server auth');
-            }
-
-            headersToSend['Authorization'] = "Bearer " + await getSionywAccessToken();
-            delete headersToSend['risu-auth'];
-        }
-        
-        
-        const response = await fetch(externalURL, {
-            method: req.method,
-            headers: headersToSend,
-            body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
-            redirect: 'manual',
-            duplex: 'half'
-        });
-        
-        for (const [key, value] of response.headers.entries()) {
-            // Skip encoding-related headers to prevent double decoding
-            if (excludedHeaders.includes(key.toLowerCase())) {
-                continue;
-            }
-            res.setHeader(key, value);
-        }
-        res.status(response.status);
-
-        if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
-            const redirectUrl = response.headers.get('location');
-            const newHeaders = { ...headersToSend };
-            const redirectResponse = await fetch(redirectUrl, {
-                method: req.method,
-                headers: newHeaders,
-                body: req.method !== 'GET' && req.method !== 'HEAD' ? req.body : undefined,
-                redirect: 'manual',
-                duplex: 'half'
-            });
-            for (const [key, value] of redirectResponse.headers.entries()) {
-                if (excludedHeaders.includes(key.toLowerCase())) {
-                    continue;
-                }
-                res.setHeader(key, value);
-            }
-            res.status(redirectResponse.status);
-            if (redirectResponse.body) {
-                await pipeline(redirectResponse.body, res);
-            } else {
-                res.end();
-            }
-            return;
-        }
-        
-        if (response.body) {
-            await pipeline(response.body, res);
-        } else {
-            res.end();
-        }
-        
-    } catch (error) {
-        console.error("[Hub Proxy] Error:", error);
-        if (!res.headersSent) {
-            res.status(502).send({ error: 'Proxy request failed: ' + error.message });
-        } else {
-            res.end();
-        }
+    const pathHeader = req.headers["x-risu-node-path"];
+    if (pathHeader) {
+      const decodedPath = decodeURIComponent(pathHeader);
+      externalURL = decodedPath;
+    } else {
+      const pathAndQuery = req.originalUrl.replace(/^\/hub-proxy/, "");
+      externalURL = hubURL + pathAndQuery;
     }
+
+    const headersToSend = { ...req.headers };
+    delete headersToSend.host;
+    delete headersToSend.connection;
+    delete headersToSend["content-length"];
+    delete headersToSend["x-risu-node-path"];
+
+    const hubOrigin = new URL(hubURL).origin;
+    headersToSend.origin = hubOrigin;
+
+    //if Authorization header is "Server-Auth, set the token to be Server-Auth
+    if (headersToSend["Authorization"] === "X-Node-Server-Auth") {
+      //this requires password auth
+      const authHeader = req.headers["risu-auth"];
+      if (!authHeader || authHeader.trim() !== password.trim()) {
+        console.log(
+          "incorrect",
+          "received:",
+          authHeader,
+          "expected:",
+          password,
+        );
+        throw new Error("Incorrect password for server auth");
+      }
+
+      headersToSend["Authorization"] =
+        "Bearer " + (await getSionywAccessToken());
+      delete headersToSend["risu-auth"];
+    }
+
+    const response = await fetch(externalURL, {
+      method: req.method,
+      headers: headersToSend,
+      body:
+        req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+      redirect: "manual",
+      duplex: "half",
+    });
+
+    for (const [key, value] of response.headers.entries()) {
+      // Skip encoding-related headers to prevent double decoding
+      if (excludedHeaders.includes(key.toLowerCase())) {
+        continue;
+      }
+      res.setHeader(key, value);
+    }
+    res.status(response.status);
+
+    if (
+      response.status >= 300 &&
+      response.status < 400 &&
+      response.headers.get("location")
+    ) {
+      const redirectUrl = response.headers.get("location");
+      const newHeaders = { ...headersToSend };
+      const redirectResponse = await fetch(redirectUrl, {
+        method: req.method,
+        headers: newHeaders,
+        body:
+          req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+        redirect: "manual",
+        duplex: "half",
+      });
+      for (const [key, value] of redirectResponse.headers.entries()) {
+        if (excludedHeaders.includes(key.toLowerCase())) {
+          continue;
+        }
+        res.setHeader(key, value);
+      }
+      res.status(redirectResponse.status);
+      if (redirectResponse.body) {
+        await pipeline(redirectResponse.body, res);
+      } else {
+        res.end();
+      }
+      return;
+    }
+
+    if (response.body) {
+      await pipeline(response.body, res);
+    } else {
+      res.end();
+    }
+  } catch (error) {
+    console.error("[Hub Proxy] Error:", error);
+    if (!res.headersSent) {
+      res.status(502).send({ error: "Proxy request failed: " + error.message });
+    } else {
+      res.end();
+    }
+  }
 }
 
-app.get('/proxy', reverseProxyFunc_get);
-app.get('/proxy2', reverseProxyFunc_get);
-app.get('/hub-proxy/*', hubProxyFunc);
+app.get("/proxy", reverseProxyFunc_get);
+app.get("/proxy2", reverseProxyFunc_get);
+app.get("/hub-proxy/*", hubProxyFunc);
 
-app.post('/proxy', reverseProxyFunc);
-app.post('/proxy2', reverseProxyFunc);
-app.post('/hub-proxy/*', hubProxyFunc);
+app.post("/proxy", reverseProxyFunc);
+app.post("/proxy2", reverseProxyFunc);
+app.post("/hub-proxy/*", hubProxyFunc);
 
-app.get('/api/password', async(req, res)=> {
-    if(password === ''){
-        res.send({status: 'unset'})
-    }
-    else if(req.headers['risu-auth']  === password){
-        res.send({status:'correct'})
-    }
-    else{
-        res.send({status:'incorrect'})
-    }
-})
-
-app.post('/api/crypto', async (req, res) => {
-    try {
-        const hash = crypto.createHash('sha256')
-        hash.update(Buffer.from(req.body.data, 'utf-8'))
-        res.send(hash.digest('hex'))
-    } catch (error) {
-        next(error)
-    }
-})
-
-
-app.post('/api/set_password', async (req, res) => {
-    if(password === ''){
-        password = req.body.password
-        writeFileSync(passwordPath, password, 'utf-8')
-    }
-    res.status(400).send("already set")
-})
-
-app.get('/api/read', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
-        console.log('incorrect')
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    const filePath = req.headers['file-path'];
-    if (!filePath) {
-        console.log('no path')
-        res.status(400).send({
-            error:'File path required'
-        });
-        return;
-    }
-
-    if(!isHex(filePath)){
-        res.status(400).send({
-            error:'Invaild Path'
-        });
-        return;
-    }
-    try {
-        if(!existsSync(path.join(savePath, filePath))){
-            res.send();
-        }
-        else{
-            res.setHeader('Content-Type','application/octet-stream');
-            res.sendFile(path.join(savePath, filePath));
-        }
-    } catch (error) {
-        next(error);
-    }
+app.get("/api/password", async (req, res) => {
+  res.status(404).send({ error: "Legacy password API removed" });
 });
 
-app.get('/api/remove', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
-        console.log('incorrect')
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    const filePath = req.headers['file-path'];
-    if (!filePath) {
-        res.status(400).send({
-            error:'File path required'
-        });
-        return;
-    }
-    if(!isHex(filePath)){
-        res.status(400).send({
-            error:'Invaild Path'
-        });
-        return;
-    }
-
-    try {
-        await fs.rm(path.join(savePath, filePath));
-        res.send({
-            success: true,
-        });
-    } catch (error) {
-        next(error);
-    }
+app.post("/api/set_password", async (req, res) => {
+  res.status(404).send("Legacy password API removed");
 });
 
-app.get('/api/list', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
-        console.log('incorrect')
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    try {
-        const data = (await fs.readdir(path.join(savePath))).map((v) => {
-            return Buffer.from(v, 'hex').toString('utf-8')
-        })
-        res.send({
-            success: true,
-            content: data
-        });
-    } catch (error) {
-        next(error);
-    }
+app.post("/api/crypto", async (req, res) => {
+  res.status(404).send({ error: "Legacy crypto API removed" });
 });
 
-app.post('/api/write', async (req, res, next) => {
-    if(req.headers['risu-auth'].trim() !== password.trim()){
-        console.log('incorrect')
-        res.status(400).send({
-            error:'Password Incorrect'
-        });
-        return
-    }
-    const filePath = req.headers['file-path'];
-    const fileContent = req.body
-    if (!filePath || !fileContent) {
-        res.status(400).send({
-            error:'File path required'
-        });
-        return;
-    }
-    if(!isHex(filePath)){
-        res.status(400).send({
-            error:'Invaild Path'
-        });
-        return;
-    }
+app.post("/api/login", async (req, res) => {
+  const { username, password, otp } = req.body;
+  if (!username || !password || !otp) {
+    return res.status(400).send({ error: "모든 입력값이 필요합니다." });
+  }
+  if (username !== authConfig.username || password !== authConfig.password) {
+    return res
+      .status(401)
+      .send({ error: "아이디 또는 비밀번호가 올바르지 않습니다." });
+  }
+  // OTP 검증
+  const isOtpValid = otplib.authenticator.check(otp, authConfig.otpSecret);
+  if (!isOtpValid) {
+    return res.status(401).send({ error: "OTP 코드가 올바르지 않습니다." });
+  }
+  // JWT 발급
+  const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: "2h" });
+  return res.send({ token });
+});
 
-    try {
-        await fs.writeFile(path.join(savePath, filePath), fileContent);
-        res.send({
-            success: true
-        });
-    } catch (error) {
-        next(error);
+// JWT 인증 미들웨어
+function verifyJWT(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).send({ error: "인증 필요" });
+  }
+  try {
+    jwt.verify(authHeader.slice(7), JWT_SECRET);
+    next();
+  } catch (e) {
+    return res.status(401).send({ error: "토큰이 유효하지 않습니다." });
+  }
+}
+
+app.get("/api/read", verifyJWT, async (req, res, next) => {
+  if (req.headers["risu-auth"].trim() !== password.trim()) {
+    console.log("incorrect");
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
+  const filePath = req.headers["file-path"];
+  if (!filePath) {
+    console.log("no path");
+    res.status(400).send({
+      error: "File path required",
+    });
+    return;
+  }
+
+  if (!isHex(filePath)) {
+    res.status(400).send({
+      error: "Invaild Path",
+    });
+    return;
+  }
+  try {
+    if (!existsSync(path.join(savePath, filePath))) {
+      res.send();
+    } else {
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.sendFile(path.join(savePath, filePath));
     }
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/remove", verifyJWT, async (req, res, next) => {
+  if (req.headers["risu-auth"].trim() !== password.trim()) {
+    console.log("incorrect");
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
+  const filePath = req.headers["file-path"];
+  if (!filePath) {
+    res.status(400).send({
+      error: "File path required",
+    });
+    return;
+  }
+  if (!isHex(filePath)) {
+    res.status(400).send({
+      error: "Invaild Path",
+    });
+    return;
+  }
+
+  try {
+    await fs.rm(path.join(savePath, filePath));
+    res.send({
+      success: true,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/list", verifyJWT, async (req, res, next) => {
+  if (req.headers["risu-auth"].trim() !== password.trim()) {
+    console.log("incorrect");
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
+  try {
+    const data = (await fs.readdir(path.join(savePath))).map((v) => {
+      return Buffer.from(v, "hex").toString("utf-8");
+    });
+    res.send({
+      success: true,
+      content: data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/write", verifyJWT, async (req, res, next) => {
+  if (req.headers["risu-auth"].trim() !== password.trim()) {
+    console.log("incorrect");
+    res.status(400).send({
+      error: "Password Incorrect",
+    });
+    return;
+  }
+  const filePath = req.headers["file-path"];
+  const fileContent = req.body;
+  if (!filePath || !fileContent) {
+    res.status(400).send({
+      error: "File path required",
+    });
+    return;
+  }
+  if (!isHex(filePath)) {
+    res.status(400).send({
+      error: "Invaild Path",
+    });
+    return;
+  }
+
+  try {
+    await fs.writeFile(path.join(savePath, filePath), fileContent);
+    res.send({
+      success: true,
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 const oauthData = {
